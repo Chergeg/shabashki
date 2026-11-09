@@ -1,0 +1,91 @@
+# НУЖЕН ТОЛЬКО ДЛЯ ЗАКРЫТЫХ КАНАЛОВ/ГРУПП. Публичные каналы бот читает без всякого входа.
+# Вход по QR-коду ОТДЕЛЬНОГО пустого аккаунта (не основного!): Actions → «Шабашки: вход (закрытые чаты)» → Run workflow.
+name: "Шабашки: вход (закрытые чаты)"
+
+on:
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: shabashki
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  login:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    outputs:
+      state: ${{ steps.out.outputs.state }}
+    steps:
+      - name: Код и состояние
+        env:
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git init -q app && cd app
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+          git fetch -q --depth=1 origin "${GITHUB_SHA}" && git checkout -q FETCH_HEAD
+          rc=0; git ls-remote --exit-code --heads origin state >/dev/null || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            git fetch -q --depth=1 origin state
+            git show FETCH_HEAD:state.bin > state.bin
+            [ -s state.bin ] || { echo "ветка state пустая — останавливаюсь"; exit 1; }
+          elif [ "$rc" -ne 2 ]; then
+            echo "не смог проверить ветку state (код $rc) — останавливаюсь"; exit 1
+          fi
+
+      - name: Библиотеки (версии и хэши зафиксированы)
+        working-directory: app
+        run: |
+          set -euo pipefail
+          for py in python3 /opt/hostedtoolcache/Python/3.12*/x64/bin/python3; do "$py" -m venv .venv && break; done
+          .venv/bin/pip install -q --disable-pip-version-check --no-deps --require-hashes -r requirements-build.txt
+          .venv/bin/pip install -q --disable-pip-version-check --no-deps --require-hashes --no-build-isolation -r requirements.txt
+
+      - name: Вход (QR придёт в твоего бота)
+        id: login
+        working-directory: app
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TG_PASSWORD: ${{ secrets.TG_PASSWORD }}
+          FOLDER: ${{ secrets.FOLDER }}
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+        run: .venv/bin/python -m shabashki login
+
+      - name: Передать состояние на сохранение
+        id: out
+        if: always() && steps.login.outcome != 'skipped'
+        working-directory: app
+        run: |
+          if [ -s state.bin ]; then echo "state=$(base64 -w0 state.bin)" >> "$GITHUB_OUTPUT"; fi
+
+  save:
+    needs: login
+    if: always() && needs.login.outputs.state != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      contents: write
+    steps:
+      - name: Сохранить состояние (зашифрованное) в ветку state
+        env:
+          STATE_B64: ${{ needs.login.outputs.state }}
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$STATE_B64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || { echo "состояние в неверном формате"; exit 1; }
+          mkdir st && cd st
+          printf '%s' "$STATE_B64" | base64 -d > state.bin
+          [ "$(head -c 4 state.bin)" = "SHB1" ] || { echo "это не наш файл состояния"; exit 1; }
+          git init -q && git checkout -q -b state && git add state.bin
+          git -c user.name=shabashki-bot -c user.email=actions@users.noreply.github.com commit -qm "state"
+          git push -q -f "https://x-access-token:${TOKEN}@github.com/${REPO}.git" state

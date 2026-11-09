@@ -1,0 +1,109 @@
+# Проверка шабашек каждые ~10 минут. Работает в облаке GitHub — ноутбук может быть выключен.
+# Сторонних actions нет: только git и pip из стандартного образа Ubuntu.
+# Два задания: «poll» видит секреты Telegram, но может только читать репозиторий;
+# «save» может писать (ветка state), но секретов Telegram не видит.
+name: "Шабашки: проверка"
+
+on:
+  schedule:
+    - cron: "3,13,23,33,43,53 * * * *"   # время UTC; GitHub иногда запускает с опозданием на несколько минут
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: shabashki   # никогда не запускаем две копии одновременно (иначе Telegram выкинет сессию)
+  cancel-in-progress: false
+  queue: max         # ожидающий «вход» не отменяется следующей проверкой
+
+jobs:
+  poll:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: read   # только читать код и ветку state
+      models: read     # бесплатная нейросеть GitHub Models
+    outputs:
+      state: ${{ steps.run.outputs.state }}
+    steps:
+      - name: Код и состояние
+        env:
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git init -q app && cd app
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+          git fetch -q --depth=1 origin "${GITHUB_SHA}" && git checkout -q FETCH_HEAD
+          # ветка state: есть → обязаны её прочитать; нет (код 2) → первый запуск; любая другая ошибка → стоп
+          rc=0; git ls-remote --exit-code --heads origin state >/dev/null || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            git fetch -q --depth=1 origin state
+            git show FETCH_HEAD:state.bin > state.bin
+            [ -s state.bin ] || { echo "ветка state пустая — останавливаюсь, чтобы ничего не затереть"; exit 1; }
+          elif [ "$rc" -ne 2 ]; then
+            echo "не смог проверить ветку state (код $rc) — останавливаюсь"; exit 1
+          fi
+
+      - name: Библиотеки (версии и хэши зафиксированы)
+        working-directory: app
+        run: |
+          set -euo pipefail
+          for py in python3 /opt/hostedtoolcache/Python/3.12*/x64/bin/python3; do "$py" -m venv .venv && break; done
+          .venv/bin/pip install -q --disable-pip-version-check --no-deps --require-hashes -r requirements-build.txt
+          .venv/bin/pip install -q --disable-pip-version-check --no-deps --require-hashes --no-build-isolation -r requirements.txt
+
+      - name: Проверить чаты и прислать шабашки
+        id: run
+        working-directory: app
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          HOME_COORDS: ${{ secrets.HOME_COORDS }}
+          FOLDER: ${{ secrets.FOLDER }}
+          CHANNELS: ${{ secrets.CHANNELS }}
+          STATE_KEY: ${{ secrets.STATE_KEY }}
+          OWNER_ID: ${{ secrets.OWNER_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          .venv/bin/python -m shabashki poll
+          if [ -s state.bin ]; then echo "state=$(base64 -w0 state.bin)" >> "$GITHUB_OUTPUT"; fi
+
+  save:
+    needs: poll
+    if: needs.poll.outputs.state != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      contents: write
+    env:
+      TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Сохранить состояние (зашифрованное) в ветку state
+        env:
+          STATE_B64: ${{ needs.poll.outputs.state }}
+        run: |
+          set -euo pipefail
+          [[ "$STATE_B64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || { echo "состояние в неверном формате"; exit 1; }
+          mkdir st && cd st
+          printf '%s' "$STATE_B64" | base64 -d > state.bin
+          [ "$(head -c 4 state.bin)" = "SHB1" ] || { echo "это не наш файл состояния"; exit 1; }
+          git init -q && git checkout -q -b state && git add state.bin
+          git -c user.name=shabashki-bot -c user.email=actions@users.noreply.github.com commit -qm "state"
+          git push -q -f "https://x-access-token:${TOKEN}@github.com/${REPO}.git" state
+
+      - name: Не дать GitHub усыпить расписание
+        # GitHub отключает расписание в публичном репо после 60 дней без активности — раз в ~50 дней пустой коммит
+        run: |
+          set -euo pipefail
+          git init -q keep && cd keep
+          git remote add origin "https://x-access-token:${TOKEN}@github.com/${REPO}.git"
+          git fetch -q --depth=1 origin "${GITHUB_SHA}" && git checkout -q FETCH_HEAD
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $(( 50 * 86400 )) ]; then
+            git -c user.name=shabashki-bot -c user.email=actions@users.noreply.github.com commit -q --allow-empty -m "keepalive"
+            git push -q origin "HEAD:${GITHUB_REF_NAME}" || echo "keepalive не удался (не страшно)"
+          fi

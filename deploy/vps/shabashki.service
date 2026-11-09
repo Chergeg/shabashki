@@ -1,0 +1,23 @@
+# systemd-служба для своего сервера (Ubuntu 24.04). Бот работает 24/7 и проверяет чаты раз в минуту.
+[Unit]
+Description=Shabashki bot (Vladivostok gigs)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=shab
+WorkingDirectory=/home/shab/shabashki-bot
+EnvironmentFile=/home/shab/shabashki-bot/.env
+ExecStart=/home/shab/shabashki-bot/.venv/bin/python -m shabashki loop
+Restart=always
+RestartSec=20
+# Песочница: бот видит только свою папку
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/shab/shabashki-bot
+MemoryMax=250M
+
+[Install]
+WantedBy=multi-user.target
