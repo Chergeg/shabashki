@@ -1,13 +1,25 @@
 # Проверка шабашек каждые ~10 минут. Работает в облаке GitHub — ноутбук может быть выключен.
-# Сторонних actions нет: только git и pip из стандартного образа Ubuntu.
-# Два задания: «poll» видит секреты Telegram, но может только читать репозиторий;
-# «save» может писать (ветка state), но секретов Telegram не видит.
+# Сторонних actions нет: только git, curl и pip из стандартного образа Ubuntu.
+#
+# Как устроен «будильник»: расписание GitHub для новых аккаунтов часто не срабатывает часами,
+# поэтому каждая проверка в конце сама заказывает следующую (workflow_dispatch от GITHUB_TOKEN —
+# так GitHub разрешает). Паузу ~9 минут держит окружение «timer» с таймером ожидания:
+# пока таймер тикает, сервер не занят. Расписание ниже — запасное: перезапустит цепочку, если она оборвётся.
+#
+# Права разделены: «poll» видит секрет бота, но может только читать репозиторий;
+# «save» пишет ветку state, но секрета не видит; «next» умеет только заказать следующую проверку.
 name: "Шабашки: проверка"
 
 on:
   schedule:
-    - cron: "3,13,23,33,43,53 * * * *"   # время UTC; GitHub иногда запускает с опозданием на несколько минут
-  workflow_dispatch: {}
+    - cron: "17 * * * *"   # запасной будильник раз в час (время UTC; GitHub может задерживать)
+  workflow_dispatch:
+    inputs:
+      wait:
+        description: "служебное: 1 — подождать ~9 минут перед проверкой"
+        required: false
+        default: "0"
+        type: string
 
 permissions: {}
 
@@ -17,7 +29,19 @@ concurrency:
   queue: max         # ожидающий «вход» не отменяется следующей проверкой
 
 jobs:
+  timer:
+    # только для запусков из цепочки: ждём таймер окружения «timer» (~9 минут), сервер в это время не занят
+    if: inputs.wait == '1'
+    runs-on: ubuntu-24.04
+    environment: timer
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - run: echo "пауза закончилась — проверяю каналы"
+
   poll:
+    needs: timer
+    if: ${{ !cancelled() && needs.timer.result != 'failure' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 8
     permissions:
@@ -73,7 +97,7 @@ jobs:
 
   save:
     needs: poll
-    if: needs.poll.outputs.state != ''
+    if: ${{ !cancelled() && needs.poll.result == 'success' && needs.poll.outputs.state != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     permissions:
@@ -107,3 +131,49 @@ jobs:
             git -c user.name=shabashki-bot -c user.email=actions@users.noreply.github.com commit -q --allow-empty -m "keepalive"
             git push -q origin "HEAD:${GITHUB_REF_NAME}" || echo "keepalive не удался (не страшно)"
           fi
+
+  next:
+    # заказать следующую проверку через ~10 минут; если другая уже ждёт в очереди — вторую цепочку не плодим
+    needs: [timer, poll, save]
+    if: ${{ !cancelled() && needs.timer.result != 'failure' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.run_id }}
+      WAITED: ${{ inputs.wait }}
+    steps:
+      - name: Заказать следующую проверку
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${REPO}/actions/workflows/bot.yml"
+          hdr=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+          # сколько запусков уже ждёт своей очереди и сколько секунд идёт этот запуск
+          info=$(curl -fsS --retry 3 "${hdr[@]}" "${api}/runs?per_page=20" | python3 -c '
+          import datetime as dt, json, os, sys
+          runs = json.load(sys.stdin).get("workflow_runs", [])
+          me = int(os.environ["RUN_ID"])
+          busy = sum(1 for r in runs if r["id"] != me and r["status"] in ("queued", "pending", "waiting", "requested", "in_progress"))
+          age = 9999
+          for r in runs:
+              if r["id"] == me and r.get("run_started_at"):
+                  start = dt.datetime.fromisoformat(r["run_started_at"].replace("Z", "+00:00"))
+                  age = int((dt.datetime.now(dt.timezone.utc) - start).total_seconds())
+          print(busy, age)') || info="0 9999"
+          read -r busy age <<<"${info}"
+          if [ "${busy}" -gt 0 ]; then echo "следующая проверка уже заказана"; exit 0; fi
+          if [ "${WAITED}" = "1" ] && [ "${age}" -lt 300 ]; then
+            # окружение timer потеряло паузу — не крутимся без остановки, ждём запасное расписание
+            echo "пауза не сработала — цепочку останавливаю"; exit 1
+          fi
+          for i in 1 2 3; do
+            if curl -fsS "${hdr[@]}" -H "Content-Type: application/json" -X POST "${api}/dispatches" \
+                -d '{"ref":"main","inputs":{"wait":"1"}}'; then
+              echo "следующая проверка — примерно через 10 минут"; exit 0
+            fi
+            sleep 10
+          done
+          echo "не смог заказать следующую проверку — цепочку перезапустит запасное расписание"; exit 1
