@@ -101,8 +101,8 @@ class LLM:
                     # 400/404 — модель недоступна, пробуем следующую
                     self.models.remove(model)
                     continue
-                except Exception:
-                    self.disabled_reason = "сеть/таймаут"
+                except Exception as e:  # noqa: BLE001 — тип ошибки в лог (без текста, там может быть что угодно)
+                    self.disabled_reason = f"сеть/таймаут ({type(e).__name__})"
                     break
             if not content:
                 continue
