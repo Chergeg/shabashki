@@ -2,9 +2,11 @@
 # Сторонних actions нет: только git, curl и pip из стандартного образа Ubuntu.
 #
 # Как устроен «будильник»: расписание GitHub для новых аккаунтов часто не срабатывает часами,
-# поэтому каждая проверка в конце сама заказывает следующую (workflow_dispatch от GITHUB_TOKEN —
-# так GitHub разрешает). Паузу ~9 минут держит окружение «timer» с таймером ожидания:
-# пока таймер тикает, сервер не занят. Расписание ниже — запасное: перезапустит цепочку, если она оборвётся.
+# поэтому каждая проверка в самом начале сама заказывает следующую (workflow_dispatch от GITHUB_TOKEN —
+# так GitHub разрешает). Следующая ждёт в очереди, пока не закончится эта, а потом ещё ~9 минут —
+# таймер окружения «timer» (пока он тикает, сервер не занят). Заказ в начале, а не в конце, —
+# чтобы цепочку не обрывали случайные сбои GitHub посреди проверки.
+# Расписание ниже — запасное: перезапустит цепочку, если она всё-таки оборвётся.
 #
 # Права разделены: «poll» видит секрет бота, но может только читать репозиторий;
 # «save» пишет ветку state, но секрета не видит; «next» умеет только заказать следующую проверку.
@@ -12,7 +14,7 @@ name: "Шабашки: проверка"
 
 on:
   schedule:
-    - cron: "17 * * * *"   # запасной будильник раз в час (время UTC; GitHub может задерживать)
+    - cron: "7,37 * * * *"   # запасной будильник (время UTC; GitHub может задерживать его на часы)
   workflow_dispatch:
     inputs:
       wait:
@@ -133,9 +135,8 @@ jobs:
           fi
 
   next:
-    # заказать следующую проверку через ~10 минут; если другая уже ждёт в очереди — вторую цепочку не плодим
-    needs: [timer, poll, save]
-    if: ${{ !cancelled() && needs.timer.result != 'failure' }}
+    # заказываем следующую проверку сразу, параллельно с этой: если эта сломается из-за сбоя GitHub,
+    # следующая уже стоит в очереди. Если в очереди уже кто-то есть — второй цепочки не плодим.
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     permissions:
@@ -144,30 +145,27 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       RUN_ID: ${{ github.run_id }}
-      WAITED: ${{ inputs.wait }}
     steps:
       - name: Заказать следующую проверку
         run: |
           set -euo pipefail
           api="https://api.github.com/repos/${REPO}/actions/workflows/bot.yml"
           hdr=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
-          # сколько запусков уже ждёт своей очереди и сколько секунд идёт этот запуск
-          info=$(curl -fsS --retry 3 "${hdr[@]}" "${api}/runs?per_page=20" | python3 -c '
+          # сколько запусков уже ждёт своей очереди и сколько всего было за последние 30 минут
+          info=$(curl -fsS --retry 3 "${hdr[@]}" "${api}/runs?per_page=30" | python3 -c '
           import datetime as dt, json, os, sys
           runs = json.load(sys.stdin).get("workflow_runs", [])
           me = int(os.environ["RUN_ID"])
+          now = dt.datetime.now(dt.timezone.utc)
           busy = sum(1 for r in runs if r["id"] != me and r["status"] in ("queued", "pending", "waiting", "requested", "in_progress"))
-          age = 9999
-          for r in runs:
-              if r["id"] == me and r.get("run_started_at"):
-                  start = dt.datetime.fromisoformat(r["run_started_at"].replace("Z", "+00:00"))
-                  age = int((dt.datetime.now(dt.timezone.utc) - start).total_seconds())
-          print(busy, age)') || info="0 9999"
-          read -r busy age <<<"${info}"
+          recent = sum(1 for r in runs
+                       if (now - dt.datetime.fromisoformat(r["created_at"].replace("Z", "+00:00"))).total_seconds() < 1800)
+          print(busy, recent)') || info="0 0"
+          read -r busy recent <<<"${info}"
           if [ "${busy}" -gt 0 ]; then echo "следующая проверка уже заказана"; exit 0; fi
-          if [ "${WAITED}" = "1" ] && [ "${age}" -lt 300 ]; then
-            # окружение timer потеряло паузу — не крутимся без остановки, ждём запасное расписание
-            echo "пауза не сработала — цепочку останавливаю"; exit 1
+          if [ "${recent}" -ge 8 ]; then
+            # норма — 3–4 запуска за полчаса; больше — значит, пауза сломалась: не крутимся без остановки
+            echo "слишком часто (${recent} за 30 минут) — цепочку останавливаю"; exit 1
           fi
           for i in 1 2 3; do
             if curl -fsS "${hdr[@]}" -H "Content-Type: application/json" -X POST "${api}/dispatches" \
